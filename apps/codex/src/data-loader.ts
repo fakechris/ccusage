@@ -184,6 +184,26 @@ export type LoadResult = {
 	missingDirectories: string[];
 };
 
+/**
+ * Detect whether a session_meta payload indicates a subagent forked from a parent.
+ * Subagent sessions replay the parent's entire token history in their rollout file,
+ * which must be filtered out to avoid massive overcounting.
+ */
+function isSubagentSession(payload: unknown): boolean {
+	if (payload == null || typeof payload !== 'object') {return false;}
+	const p = payload as Record<string, unknown>;
+	if (p.forked_from_id != null) {return true;}
+	const source = p.source;
+	if (source != null && typeof source === 'object') {
+		const s = source as Record<string, unknown>;
+		if (s.subagent != null && typeof s.subagent === 'object') {
+			const sub = s.subagent as Record<string, unknown>;
+			if (sub.thread_spawn != null) {return true;}
+		}
+	}
+	return false;
+}
+
 export async function loadTokenUsageEvents(options: LoadOptions = {}): Promise<LoadResult> {
 	const providedDirs =
 		options.sessionDirs != null && options.sessionDirs.length > 0
@@ -239,6 +259,15 @@ export async function loadTokenUsageEvents(options: LoadOptions = {}): Promise<L
 			let currentModel: string | undefined;
 			let currentModelIsFallback = false;
 			let legacyFallbackUsed = false;
+
+			// Subagent replay detection state
+			let isSubagent = false;
+			let creationMinute: string | null = null;
+			let replayBoundaryFound = false;
+
+			// Deduplication: track (timestamp, input_tokens, output_tokens) tuples
+			const seenTokenKeys = new Set<string>();
+
 			const lines = fileContentResult.value.split(/\r?\n/);
 			for (const line of lines) {
 				const trimmed = line.trim();
@@ -263,6 +292,21 @@ export async function loadTokenUsageEvents(options: LoadOptions = {}): Promise<L
 
 				const { type: entryType, payload, timestamp } = entryParse.output;
 
+				// Detect subagent sessions from session_meta entries
+				if (entryType === 'session_meta') {
+					if (!isSubagent && payload != null && typeof payload === 'object') {
+						isSubagent = isSubagentSession(payload);
+						if (isSubagent && creationMinute == null && timestamp != null) {
+							creationMinute = timestamp.slice(0, 16); // YYYY-MM-DDTHH:MM
+							logger.debug('Subagent session detected, will skip replayed parent history', {
+								file,
+								creationMinute,
+							});
+						}
+					}
+					continue;
+				}
+
 				if (entryType === 'turn_context') {
 					const contextPayload = v.safeParse(recordSchema, payload ?? null);
 					if (contextPayload.success) {
@@ -286,6 +330,28 @@ export async function loadTokenUsageEvents(options: LoadOptions = {}): Promise<L
 
 				if (timestamp == null) {
 					continue;
+				}
+
+				// Skip replayed parent history in subagent sessions.
+				// Replayed entries all share the creation timestamp (same second),
+				// while the subagent's own real entries have later timestamps.
+				if (isSubagent && !replayBoundaryFound && creationMinute != null) {
+					if (timestamp.slice(0, 16) === creationMinute) {
+						// Still in the replay — update previousTotals but don't emit events
+						const info = tokenPayloadResult.output.info;
+						const totalUsage = normalizeRawUsage(info?.total_token_usage);
+						if (totalUsage != null) {
+							previousTotals = totalUsage;
+						}
+						continue;
+					}
+					// First entry with a different second = end of replay
+					replayBoundaryFound = true;
+					logger.debug('Replay boundary found for subagent session', {
+						file,
+						replayEnd: creationMinute,
+						firstLiveTimestamp: timestamp,
+					});
 				}
 
 				const info = tokenPayloadResult.output.info;
@@ -314,6 +380,13 @@ export async function loadTokenUsageEvents(options: LoadOptions = {}): Promise<L
 				) {
 					continue;
 				}
+
+				// Deduplicate entries with identical (timestamp, input_tokens, output_tokens)
+				const dedupeKey = `${timestamp}:${delta.inputTokens}:${delta.outputTokens}:${delta.cachedInputTokens}`;
+				if (seenTokenKeys.has(dedupeKey)) {
+					continue;
+				}
+				seenTokenKeys.add(dedupeKey);
 
 				const payloadRecordResult = v.safeParse(recordSchema, payload ?? undefined);
 				const extractionSource = payloadRecordResult.success
@@ -483,6 +556,204 @@ if (import.meta.vitest != null) {
 			expect(events).toHaveLength(1);
 			expect(events[0]!.model).toBe('gpt-5');
 			expect(events[0]!.isFallbackModel).toBe(true);
+		});
+
+		it('skips replayed parent history in subagent sessions', async () => {
+			await using fixture = await createFixture({
+				sessions: {
+					'subagent.jsonl': [
+						JSON.stringify({
+							timestamp: '2026-04-15T03:40:10.220Z',
+							type: 'session_meta',
+							payload: {
+								id: 'sub-001',
+								forked_from_id: 'parent-001',
+								source: {
+									subagent: {
+										thread_spawn: { parent_thread_id: 'parent-001' },
+									},
+								},
+							},
+						}),
+						JSON.stringify({
+							timestamp: '2026-04-15T03:40:10.221Z',
+							type: 'session_meta',
+							payload: { id: 'parent-001' },
+						}),
+						JSON.stringify({
+							timestamp: '2026-04-15T03:40:10.222Z',
+							type: 'turn_context',
+							payload: { model: 'gpt-5.4' },
+						}),
+						JSON.stringify({
+							timestamp: '2026-04-15T03:40:10.222Z',
+							type: 'event_msg',
+							payload: {
+								type: 'token_count',
+								info: {
+									total_token_usage: {
+										input_tokens: 100_000,
+										cached_input_tokens: 50_000,
+										output_tokens: 500,
+										reasoning_output_tokens: 0,
+										total_tokens: 100_500,
+									},
+									last_token_usage: {
+										input_tokens: 100_000,
+										cached_input_tokens: 50_000,
+										output_tokens: 500,
+										reasoning_output_tokens: 0,
+										total_tokens: 100_500,
+									},
+									model: 'gpt-5.4',
+								},
+							},
+						}),
+						JSON.stringify({
+							timestamp: '2026-04-15T03:40:10.223Z',
+							type: 'event_msg',
+							payload: {
+								type: 'token_count',
+								info: {
+									total_token_usage: {
+										input_tokens: 200_000,
+										cached_input_tokens: 100_000,
+										output_tokens: 1_000,
+										reasoning_output_tokens: 0,
+										total_tokens: 201_000,
+									},
+									last_token_usage: {
+										input_tokens: 100_000,
+										cached_input_tokens: 50_000,
+										output_tokens: 500,
+										reasoning_output_tokens: 0,
+										total_tokens: 100_500,
+									},
+									model: 'gpt-5.4',
+								},
+							},
+						}),
+						JSON.stringify({
+							timestamp: '2026-04-15T03:40:10.223Z',
+							type: 'event_msg',
+							payload: {
+								type: 'token_count',
+								info: {
+									total_token_usage: {
+										input_tokens: 200_000,
+										cached_input_tokens: 100_000,
+										output_tokens: 1_000,
+										reasoning_output_tokens: 0,
+										total_tokens: 201_000,
+									},
+									last_token_usage: {
+										input_tokens: 100_000,
+										cached_input_tokens: 50_000,
+										output_tokens: 500,
+										reasoning_output_tokens: 0,
+										total_tokens: 100_500,
+									},
+									model: 'gpt-5.4',
+								},
+							},
+						}),
+						JSON.stringify({
+							timestamp: '2026-04-15T03:41:01.000Z',
+							type: 'turn_context',
+							payload: { model: 'gpt-5.4' },
+						}),
+						JSON.stringify({
+							timestamp: '2026-04-15T03:41:01.500Z',
+							type: 'event_msg',
+							payload: {
+								type: 'token_count',
+								info: {
+									total_token_usage: {
+										input_tokens: 200_500,
+										cached_input_tokens: 100_200,
+										output_tokens: 1_010,
+										reasoning_output_tokens: 10,
+										total_tokens: 201_510,
+									},
+									last_token_usage: {
+										input_tokens: 500,
+										cached_input_tokens: 200,
+										output_tokens: 10,
+										reasoning_output_tokens: 10,
+										total_tokens: 510,
+									},
+									model: 'gpt-5.4',
+								},
+							},
+						}),
+					].join('\n'),
+				},
+			});
+
+			const { events } = await loadTokenUsageEvents({
+				sessionDirs: [fixture.getPath('sessions')],
+			});
+
+			expect(events).toHaveLength(1);
+			expect(events[0]!.inputTokens).toBe(500);
+			expect(events[0]!.outputTokens).toBe(10);
+			expect(events[0]!.cachedInputTokens).toBe(200);
+			expect(events[0]!.model).toBe('gpt-5.4');
+		});
+
+		it('deduplicates identical token_count entries', async () => {
+			await using fixture = await createFixture({
+				sessions: {
+					'duplicate.jsonl': [
+						JSON.stringify({
+							timestamp: '2025-09-11T18:25:30.000Z',
+							type: 'turn_context',
+							payload: { model: 'gpt-5' },
+						}),
+						JSON.stringify({
+							timestamp: '2025-09-11T18:25:40.670Z',
+							type: 'event_msg',
+							payload: {
+								type: 'token_count',
+								info: {
+									last_token_usage: {
+										input_tokens: 1_200,
+										cached_input_tokens: 200,
+										output_tokens: 500,
+										reasoning_output_tokens: 0,
+										total_tokens: 1_700,
+									},
+									model: 'gpt-5',
+								},
+							},
+						}),
+						JSON.stringify({
+							timestamp: '2025-09-11T18:25:40.670Z',
+							type: 'event_msg',
+							payload: {
+								type: 'token_count',
+								info: {
+									last_token_usage: {
+										input_tokens: 1_200,
+										cached_input_tokens: 200,
+										output_tokens: 500,
+										reasoning_output_tokens: 0,
+										total_tokens: 1_700,
+									},
+									model: 'gpt-5',
+								},
+							},
+						}),
+					].join('\n'),
+				},
+			});
+
+			const { events } = await loadTokenUsageEvents({
+				sessionDirs: [fixture.getPath('sessions')],
+			});
+
+			expect(events).toHaveLength(1);
+			expect(events[0]!.inputTokens).toBe(1_200);
 		});
 	});
 }
